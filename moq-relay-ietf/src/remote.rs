@@ -15,12 +15,12 @@ use moq_transport::serve::{Track, TrackReader, TrackWriter};
 use moq_transport::watch::State;
 use url::Url;
 
-use crate::Api;
+use crate::Coordinator;
 
 /// Information about remote origins.
 pub struct Remotes {
     /// The client we use to fetch/store origin information.
-    pub api: Api,
+    pub coordinator: Arc<dyn Coordinator>,
 
     // A QUIC endpoint we'll use to fetch from other origins.
     pub quic: quic::Client,
@@ -134,14 +134,11 @@ impl RemotesConsumer {
         namespace: &TrackNamespace,
     ) -> anyhow::Result<Option<RemoteConsumer>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let origin = match self.api.get_origin(&namespace.to_utf8_path()).await? {
-            None => return Ok(None),
-            Some(origin) => origin,
-        };
+        let (origin, client) = self.coordinator.lookup(namespace).await?;
 
         // Check if we already have a remote for this origin
         let state = self.state.lock();
-        if let Some(remote) = state.lookup.get(&origin.url).cloned() {
+        if let Some(remote) = state.lookup.get(&origin.url()).cloned() {
             return Ok(Some(remote));
         }
 
@@ -152,8 +149,9 @@ impl RemotesConsumer {
         };
 
         let remote = Remote {
-            url: origin.url.clone(),
+            url: origin.url(),
             remotes: self.info.clone(),
+            client,
         };
 
         // Produce the remote
@@ -161,7 +159,7 @@ impl RemotesConsumer {
         state.requested.push_back(writer);
 
         // Insert the remote into our Map
-        state.lookup.insert(origin.url, reader.clone());
+        state.lookup.insert(origin.url(), reader.clone());
 
         Ok(Some(reader))
     }
@@ -178,6 +176,7 @@ impl ops::Deref for RemotesConsumer {
 pub struct Remote {
     pub remotes: Arc<Remotes>,
     pub url: Url,
+    pub client: Option<quic::Client>,
 }
 
 impl fmt::Debug for Remote {
@@ -226,8 +225,13 @@ impl RemoteProducer {
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
+        let client = if let Some(client) = &self.info.client {
+            client
+        } else {
+            &self.quic
+        };
         // TODO reuse QUIC and MoQ sessions
-        let (session, _quic_client_initial_cid) = self.quic.connect(&self.url).await?;
+        let (session, _quic_client_initial_cid) = client.connect(&self.url, None).await?;
         let (session, subscriber) = moq_transport::session::Subscriber::connect(session).await?;
 
         // Run the session
@@ -311,10 +315,10 @@ impl RemoteConsumer {
     /// Request a track from the broadcast.
     pub fn subscribe(
         &self,
-        namespace: TrackNamespace,
-        name: String,
+        namespace: &TrackNamespace,
+        name: &str,
     ) -> anyhow::Result<Option<RemoteTrackReader>> {
-        let key = (namespace.clone(), name.clone());
+        let key = (namespace.clone(), name.to_string());
         let state = self.state.lock();
         if let Some(track) = state.tracks.get(&key) {
             if let Some(track) = track.upgrade() {
@@ -327,7 +331,7 @@ impl RemoteConsumer {
             None => return Ok(None),
         };
 
-        let (writer, reader) = Track::new(namespace, name).produce();
+        let (writer, reader) = Track::new(namespace.clone(), name.to_string()).produce();
         let reader = RemoteTrackReader::new(reader, self.state.clone());
 
         // Insert the track into our Map so we deduplicate future requests.

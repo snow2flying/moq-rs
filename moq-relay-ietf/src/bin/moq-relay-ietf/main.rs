@@ -1,25 +1,15 @@
-use clap::Parser;
+mod api_coordinator;
+mod file_coordinator;
 
-mod api;
-mod consumer;
-mod local;
-mod producer;
-mod relay;
-mod remote;
-mod session;
-mod web;
-
-pub use api::*;
-pub use consumer::*;
-pub use local::*;
-pub use producer::*;
-pub use relay::*;
-pub use remote::*;
-pub use session::*;
-pub use web::*;
-
+use std::sync::Arc;
 use std::{net, path::PathBuf};
+
+use clap::Parser;
 use url::Url;
+
+use api_coordinator::{ApiCoordinator, ApiCoordinatorConfig};
+use file_coordinator::FileCoordinator;
+use moq_relay_ietf::{Coordinator, Relay, RelayConfig, Web, WebConfig};
 
 #[derive(Parser, Clone)]
 pub struct Cli {
@@ -68,6 +58,26 @@ pub struct Cli {
     /// Requires --dev to enable the web server. Only serves files by exact CID - no index.
     #[arg(long)]
     pub mlog_serve: bool,
+
+    /// Path to the shared coordinator file for multi-relay coordination.
+    /// Multiple relay instances can share namespace/track registration via this file.
+    /// User doesn't have to explicitly create and populate anything. This path will be
+    /// used by file coordinator to store namespace/track registration information.
+    /// User need to make sure if multiple relay's are being used all of them have same path
+    /// to this file.
+    #[arg(long, default_value = "/tmp/moq-coordinator.json")]
+    pub coordinator_file: PathBuf,
+
+    /// URL of the moq-api server for coordination (e.g., "http://localhost:8080").
+    /// When specified, uses moq-api HTTP server instead of file-based coordination.
+    /// This is useful when running a cluster of relays with a centralized API server.
+    #[arg(long)]
+    pub api_url: Option<Url>,
+
+    /// TTL in seconds for namespace registrations in the API.
+    /// Only used when --api-url is specified.
+    #[arg(long, default_value = "600")]
+    pub api_ttl: u64,
 }
 
 #[tokio::main]
@@ -103,15 +113,34 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Build the relay URL from the node or bind address
+    let relay_url = cli
+        .node
+        .clone()
+        .unwrap_or_else(|| Url::parse(&format!("https://{}", cli.bind)).unwrap());
+
+    // Create the coordinator based on CLI arguments
+    // Priority: api-url > file coordinator
+    let coordinator: Arc<dyn Coordinator> = if let Some(api_url) = &cli.api_url {
+        let config = ApiCoordinatorConfig::new(api_url.clone(), relay_url).with_ttl(cli.api_ttl);
+        let api_coordinator = ApiCoordinator::new(config);
+        log::info!("using API coordinator: {}", api_url);
+        Arc::new(api_coordinator)
+    } else {
+        log::info!("using file coordinator: {}", cli.coordinator_file.display());
+        Arc::new(FileCoordinator::new(&cli.coordinator_file, relay_url))
+    };
+
     // Create a QUIC server for media.
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
-        bind: cli.bind,
+        bind: Some(cli.bind),
+        endpoints: vec![],
         qlog_dir: qlog_dir_for_relay,
         mlog_dir: mlog_dir_for_relay,
         node: cli.node,
-        api: cli.api,
         announce: cli.announce,
+        coordinator,
     })?;
 
     if cli.dev {
