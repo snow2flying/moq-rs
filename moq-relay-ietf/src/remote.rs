@@ -134,7 +134,7 @@ impl RemotesConsumer {
         namespace: &TrackNamespace,
     ) -> anyhow::Result<Option<RemoteConsumer>> {
         // Always fetch the origin instead of using the (potentially invalid) cache.
-        let (origin, client) = self.coordinator.lookup(&namespace).await?;
+        let (origin, client) = self.coordinator.lookup(namespace).await?;
 
         // Check if we already have a remote for this origin
         let state = self.state.lock();
